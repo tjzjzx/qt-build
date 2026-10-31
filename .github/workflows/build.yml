@@ -9,20 +9,22 @@ on:
         default: ''
   push:
     tags:
-      - 'v*'                    # 仅 v 开头的 tag 触发，例如 v6.12.0
+      - 'v*'
 
 env:
   QT_VERSION: '6.12.0'
   MINGW_URL: >-
     https://github.com/niXman/mingw-builds-binaries/releases/download/
     16.2.0-rt_v14-rev1/x86_64-16.2.0-release-posix-seh-ucrt-rt_v14-rev1.7z
-  # 首次 tag 触发用 github.run_id；自动接力时沿用同一个 ID
   LOGICAL_RUN_ID: ${{ github.event.inputs.run_id || github.run_id }}
+
+permissions:
+  contents: write          # 发布 Release 和上传资产所必需
 
 jobs:
   build-qt:
     runs-on: windows-latest
-    timeout-minutes: 350          # 留出余量，构建步骤自身还会进一步限制
+    timeout-minutes: 350
 
     steps:
       - name: Checkout
@@ -52,19 +54,10 @@ jobs:
           "$env:GITHUB_WORKSPACE\mingw64\bin" |
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Verify toolchain
-        shell: cmd
-        run: |
-          where gcc
-          gcc --version
-          cmake --version
-          ninja --version
-
       # ---------- 源码 + 构建缓存 ----------
       - name: Restore source and build cache
         uses: actions/cache@v4
         with:
-          # 缓存键绑定逻辑运行 ID，同一次逻辑构建的所有接力共享进度
           key: qt-${{ env.LOGICAL_RUN_ID }}-${{ env.QT_VERSION }}-mingw
           path: |
             qt-everywhere-src-${{ env.QT_VERSION }}
@@ -87,7 +80,7 @@ jobs:
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # ---------- 配置（仅首次）----------
-      - name: Configure Qt (skip WebEngine only)
+      - name: Configure Qt (skip WebEngine, MinGW constraint)
         shell: cmd
         run: |
           if not exist "build\CMakeCache.txt" (
@@ -105,7 +98,7 @@ jobs:
               -skip qtwebengine
           )
 
-      # ---------- 增量构建（可超时，不中断工作流）----------
+      # ---------- 增量构建 ----------
       - name: Build Qt (incremental)
         id: build
         shell: cmd
@@ -113,7 +106,6 @@ jobs:
         continue-on-error: true
         run: |
           cd build
-          REM 控制并行度，避免 WebEngine 之外的模块在高并发下 OOM
           cmake --build . --parallel 4
 
       # ---------- 完成检测 ----------
@@ -129,6 +121,7 @@ jobs:
             echo "complete=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           }
 
+      # ---------- 安装（如果完成）----------
       - name: Install Qt (if complete)
         if: steps.check.outputs.complete == 'true'
         shell: cmd
@@ -136,22 +129,35 @@ jobs:
           cd build
           cmake --install .
 
-      - name: Upload Qt install (if complete)
+      # ---------- 打包为 zip（如果完成）----------
+      - name: Package Qt install as zip (if complete)
         if: steps.check.outputs.complete == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0-skip-webengine
-          path: ${{ github.workspace }}\qt-install
-          if-no-files-found: error
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\qt-install\*" `
+            -DestinationPath "qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0.zip" -Force
+          Get-Item "qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0.zip" | Select-Object Name, Length
 
-      # ---------- 自动接力（核心）----------
+      # ---------- 自动发布 Release（如果完成）----------
+      - name: Create GitHub Release and upload asset
+        if: steps.check.outputs.complete == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Qt ${{ env.QT_VERSION }} (MinGW GCC 16.2.0)
+          draft: false
+          prerelease: false
+          generate_release_notes: true       # 自动生成 release notes
+          files: qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0.zip
+
+      # ---------- 自动接力（如果未完成）----------
       - name: Auto-trigger next chunk (if not complete)
         if: steps.check.outputs.complete == 'false'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh workflow run "Build Qt 6.12.0 (MinGW GCC 16.2.0, Auto-Chained)" `
+          gh workflow run "Build Qt 6.12.0 (MinGW, Auto-Release)" `
             --repo "${{ github.repository }}" `
             --ref "${{ github.ref_name }}" `
             -f run_id="${{ env.LOGICAL_RUN_ID }}"
