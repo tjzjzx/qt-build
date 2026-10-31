@@ -62,6 +62,7 @@ jobs:
     timeout-minutes: 350
     outputs:
       complete: ${{ steps.decide.outputs.complete }}
+      build_started: ${{ steps.build.outcome != 'skipped' }}
 
     steps:
       - name: Checkout
@@ -226,7 +227,11 @@ jobs:
         run: |
           $cache = Get-Content "build\CMakeCache.txt" -Raw
           foreach ($v in @("CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER")) {
-            if ($cache -notmatch "(?m)^$v:[A-Z_]+=.*ccache") {
+            # 注意用 ${v}：裸写 $v: 会被 PowerShell 当成驱动器限定变量（$env:PATH 那种），直接 ParserError
+            $line = ($cache -split "`n" | Where-Object { $_ -match "^\s*${v}:" }) -join " | "
+            if (-not $line) { throw "$v is missing from CMakeCache.txt" }
+            Write-Host "$v -> $line"
+            if ($line -notmatch "=.*ccache") {
               throw "$v is not set to ccache - the build would not be cached"
             }
           }
@@ -348,9 +353,12 @@ jobs:
   # ---------- 自动接力 ----------
   # 独立 job + needs：必须等 build-qt 的缓存保存跑完再派发下一轮，
   # 否则下一轮会在缓存还在写的时候去 restore，拿到的是更旧的快照
+  #
+  # 只有"构建真的跑起来了"才接力：configure / 校验 / 下载这类前置步骤失败是
+  # 确定性错误，重试只会原样再失败一遍，白白每轮烧掉十几分钟额度
   relay:
     needs: build-qt
-    if: ${{ !cancelled() && needs.build-qt.outputs.complete != 'true' }}
+    if: ${{ !cancelled() && needs.build-qt.outputs.build_started == 'true' && needs.build-qt.outputs.complete != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch next chunk
