@@ -53,19 +53,20 @@ jobs:
           "$env:GITHUB_WORKSPACE\mingw64\bin" |
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      # ---------- 源码 + 构建缓存 ----------
-      - name: Restore source and build cache
+      # ---------- 仅缓存 build 目录 ----------
+      - name: Restore build cache
+        id: cache-restore
         uses: actions/cache@v4
         with:
-          key: qt-${{ env.LOGICAL_RUN_ID }}-${{ env.QT_VERSION }}-mingw
-          path: |
-            qt-everywhere-src-${{ env.QT_VERSION }}
-            build
+          key: qt-build-${{ env.LOGICAL_RUN_ID }}-${{ env.QT_VERSION }}-mingw
+          path: build        # 只缓存构建目录
 
-      - name: Download Qt source (if not cached)
+      # ---------- 每次运行都重新下载并解压源码 ----------
+      - name: Download and extract Qt source
         shell: pwsh
         run: |
           $src = "qt-everywhere-src-$env:QT_VERSION"
+          # 如果源码目录已存在（同一 job 内重试），则跳过
           if (-not (Test-Path $src)) {
             $v = $env:QT_VERSION
             $url = "https://download.qt.io/official_releases/qt/" +
