@@ -14,8 +14,7 @@ on:
 env:
   QT_VERSION: '6.12.0'
   MINGW_URL: >-
-    https://github.com/niXman/mingw-builds-binaries/releases/download/
-    16.2.0-rt_v14-rev1/x86_64-16.2.0-release-posix-seh-ucrt-rt_v14-rev1.7z
+    https://github.com/niXman/mingw-builds-binaries/releases/download/16.2.0-rt_v14-rev1/x86_64-16.2.0-release-posix-seh-ucrt-rt_v14-rev1.7z
   LOGICAL_RUN_ID: ${{ github.event.inputs.run_id || github.run_id }}
 
 permissions:
