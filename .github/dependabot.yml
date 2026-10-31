@@ -1,0 +1,11 @@
+version: 2
+
+# workflow 里的 actions 都钉在 commit SHA 上（供应链安全），
+# 这里负责在每周把 SHA + 版本注释一起升级。
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"

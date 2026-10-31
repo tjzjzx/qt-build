@@ -4,179 +4,370 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "Logical run ID for cache continuity (leave empty on first run)"
+        description: "Logical run ID shared by all chunks (leave empty on first run)"
         required: false
         default: ""
+      chunk:
+        description: "Chunk index, auto-incremented by the relay job"
+        required: false
+        default: "1"
+      release_tag:
+        description: "Tag to publish the build to"
+        required: false
+        default: "qt-6.12.0-mingw-gcc16.2"
   push:
     tags:
       - "v*"
 
-env:
-  QT_VERSION: "6.12.0"
-  MINGW_URL: >-
-    https://github.com/niXman/mingw-builds-binaries/releases/download/16.2.0-rt_v14-rev1/x86_64-16.2.0-release-posix-seh-ucrt-rt_v14-rev1.7z
-  LOGICAL_RUN_ID: ${{ github.event.inputs.run_id || github.run_id }}
+# 同一个逻辑任务的所有 chunk 串行执行，避免两轮同时读写同一份缓存
+concurrency:
+  group: qt-mingw-${{ github.event.inputs.run_id || github.run_id }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write # 发布 Release 和上传资产所必需
+  contents: write   # 创建 Release / 上传资产
+  actions: write    # relay 里 `gh workflow run` 需要 actions:write，缺了会 403
+
+env:
+  QT_VERSION: "6.12.0"
+  GCC_VERSION: "16.2.0"
+  CCACHE_VERSION: "4.14.2"
+  CACHE_EPOCH: "v1"        # 需要整体作废缓存时改这里
+  MAX_CHUNKS: "12"         # 防止"永远跑不完"的无限接力
+  MINGW_URL: >-
+    https://github.com/niXman/mingw-builds-binaries/releases/download/16.2.0-rt_v14-rev1/x86_64-16.2.0-release-posix-seh-ucrt-rt_v14-rev1.7z
+  CCACHE_URL: >-
+    https://github.com/ccache/ccache/releases/download/v4.14.2/ccache-4.14.2-windows-x86_64.zip
+  # qt-everywhere-src-<ver>.tar.xz 的 MD5（Qt 官方只有 md5sums.txt，没有 sha256）
+  # 来源：https://download.qt.io/official_releases/qt/6.12/6.12.0/single/md5sums.txt
+  # 换 QT_VERSION 时必须同步更新
+  QT_SRC_MD5: "ac677cc64158740f257fd37a5b4c5ffb"
+  LOGICAL_RUN_ID: ${{ github.event.inputs.run_id || github.run_id }}
+  CHUNK: ${{ github.event.inputs.chunk || '1' }}
+  # dispatch 运行没有 tag，不能退回 github.ref_name（那是分支名），否则会发出 tag=main 的 Release
+  RELEASE_TAG: ${{ github.event.inputs.release_tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'qt-6.12.0-mingw-gcc16.2' }}
+  SEVEN_ZIP: "C:\\Program Files\\7-Zip\\7z.exe"
+
+  # ---------- ccache 配置 ----------
+  CCACHE_DIR: "D:\\ccache"
+  CCACHE_MAXSIZE: "5G"
+  CCACHE_COMPRESS: "true"
+  # MinGW 每个 chunk 都重新下载，mtime 必然变化；用固定字符串避免整份缓存因
+  # 编译器"变了"而全部失效（content 检查每次都要哈希 100MB 的 gcc.exe，太慢）
+  CCACHE_COMPILERCHECK: "string:gcc-16.2.0-posix-seh-ucrt-gcc16"
 
 jobs:
   build-qt:
     runs-on: windows-latest
     timeout-minutes: 350
+    outputs:
+      complete: ${{ steps.decide.outputs.complete }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # ---------- 工具链 ----------
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
       - name: Setup Perl (Strawberry)
-        uses: shogo82148/actions-setup-perl@v1
+        uses: shogo82148/actions-setup-perl@3b59bd33efdae98406a9bc4b75a4aa041e11993a # v1.44.4
         with:
           perl-version: "5.38"
           distribution: strawberry
 
       - name: Install Python html5lib
         shell: pwsh
-        run: pip install html5lib
+        run: python -m pip install --disable-pip-version-check html5lib
 
-      - name: Download and extract MinGW GCC 16.2.0
+      - name: Download and extract MinGW GCC ${{ env.GCC_VERSION }}
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri $env:MINGW_URL -OutFile mingw.7z
-          & "C:\Program Files\7-Zip\7z.exe" x mingw.7z -o"$env:GITHUB_WORKSPACE" -y
+          $ErrorActionPreference = "Stop"
+          $sevenZip = $env:SEVEN_ZIP
+          if (-not (Test-Path $sevenZip)) { $sevenZip = "C:\Program Files (x86)\7-Zip\7z.exe" }
+          if (-not (Test-Path $sevenZip)) { throw "7-Zip not found on runner" }
+
+          # curl.exe 比 Invoke-WebRequest 稳定（重试 + 不占内存）
+          curl.exe -L --fail --retry 5 --retry-delay 5 --retry-all-errors `
+            -o mingw.7z "$env:MINGW_URL"
+          if ($LASTEXITCODE -ne 0) { throw "MinGW download failed: $LASTEXITCODE" }
+
+          & $sevenZip x mingw.7z -o"$env:GITHUB_WORKSPACE" -y
+          if ($LASTEXITCODE -ne 0) { throw "MinGW extract failed: $LASTEXITCODE" }
+          Remove-Item mingw.7z -Force -ErrorAction SilentlyContinue
+
+          # GITHUB_PATH 只对后续步骤生效，这里必须用绝对路径自检
+          & "$env:GITHUB_WORKSPACE\mingw64\bin\gcc.exe" --version | Select-Object -First 1
+
           "$env:GITHUB_WORKSPACE\mingw64\bin" |
             Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      # ---------- 仅缓存 build 目录 ----------
-      - name: Restore build cache
-        id: cache-restore
-        uses: actions/cache@v4
-        with:
-          key: qt-build-${{ env.LOGICAL_RUN_ID }}-${{ env.QT_VERSION }}-mingw
-          path: build        # 只缓存构建目录
-
-      # ---------- 每次运行都重新下载并解压源码 ----------
-      - name: Download and extract Qt source
+      - name: Install ccache ${{ env.CCACHE_VERSION }}
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $sevenZip = $env:SEVEN_ZIP
+          if (-not (Test-Path $sevenZip)) { $sevenZip = "C:\Program Files (x86)\7-Zip\7z.exe" }
+
+          curl.exe -L --fail --retry 5 --retry-delay 5 --retry-all-errors `
+            -o ccache.zip "$env:CCACHE_URL"
+          if ($LASTEXITCODE -ne 0) { throw "ccache download failed: $LASTEXITCODE" }
+
+          $root = "C:\ccache-tool"
+          Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
+          & $sevenZip x ccache.zip -o"$root" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "ccache extract failed: $LASTEXITCODE" }
+
+          $exe = Get-ChildItem -Path $root -Filter ccache.exe -Recurse | Select-Object -First 1
+          if (-not $exe) { throw "ccache.exe not found in the archive" }
+          & $exe.FullName --version | Select-Object -First 1
+
+          (Split-Path $exe.FullName) |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # ---------- 源码缓存（内容不变，用不可覆盖的固定 key 正合适）----------
+      - name: Restore Qt source cache
+        id: src-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: qt-everywhere-src-${{ env.QT_VERSION }}
+          key: qtsrc-${{ env.CACHE_EPOCH }}-${{ env.QT_VERSION }}
+
+      - name: Download Qt source (if not cached)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
           $src = "qt-everywhere-src-$env:QT_VERSION"
-          # 如果源码目录已存在（同一 job 内重试），则跳过
-          if (-not (Test-Path $src)) {
+          $marker = Join-Path $src ".download-ok"
+
+          # 用标记文件判断完整性：被 kill 的半截解压目录以前会被当成"已下载"永久复用
+          if (-not (Test-Path $marker)) {
+            if (Test-Path $src) { Remove-Item $src -Recurse -Force }
+
             $v = $env:QT_VERSION
             $url = "https://download.qt.io/official_releases/qt/" +
                    "$($v.Split('.')[0]).$($v.Split('.')[1])/$v/single/" +
                    "qt-everywhere-src-$v.tar.xz"
-            Invoke-WebRequest -Uri $url -OutFile qt-src.tar.xz
-            & "C:\Program Files\7-Zip\7z.exe" x qt-src.tar.xz -y
-            & "C:\Program Files\7-Zip\7z.exe" x qt-src.tar -y
+            $sevenZip = $env:SEVEN_ZIP
+            if (-not (Test-Path $sevenZip)) { $sevenZip = "C:\Program Files (x86)\7-Zip\7z.exe" }
+
+            curl.exe -L --fail --retry 5 --retry-delay 5 --retry-all-errors -o qt-src.tar.xz $url
+            if ($LASTEXITCODE -ne 0) { throw "Qt source download failed: $LASTEXITCODE" }
+
+            # 1 GB 级别的裸下载，先确认没被截断/损坏，再去花几十分钟解压
+            $md5 = (Get-FileHash qt-src.tar.xz -Algorithm MD5).Hash.ToLower()
+            if ($md5 -ne $env:QT_SRC_MD5) {
+              throw "Qt source checksum mismatch: got $md5, expected $env:QT_SRC_MD5"
+            }
+
+            & $sevenZip x qt-src.tar.xz -y
+            if ($LASTEXITCODE -ne 0) { throw "xz extract failed: $LASTEXITCODE" }
+            & $sevenZip x qt-src.tar -y
+            if ($LASTEXITCODE -ne 0) { throw "tar extract failed: $LASTEXITCODE" }
+
+            Remove-Item qt-src.tar.xz, qt-src.tar -Force -ErrorAction SilentlyContinue
+            New-Item $marker -ItemType File -Force | Out-Null
           }
+
           "QT_SRC_DIR=$env:GITHUB_WORKSPACE\$src" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # ---------- 配置（仅首次）----------
+      # ---------- 编译缓存 ----------
+      # 只缓存 ccache，不缓存 build 树：构建树几十 GB，必然撑爆仓库 10 GB 的缓存上限；
+      # ccache 压缩后约 1~3 GB，且 key 每轮都换（缓存条目不可覆盖，固定 key 会
+      # 导致第一轮之后的进度永远存不进去）
+      - name: Restore ccache
+        id: ccache-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ env.CACHE_EPOCH }}-${{ env.QT_VERSION }}-gcc${{ env.GCC_VERSION }}-${{ env.LOGICAL_RUN_ID }}-chunk-${{ env.CHUNK }}-a${{ github.run_attempt }}
+          restore-keys: |
+            ccache-${{ env.CACHE_EPOCH }}-${{ env.QT_VERSION }}-gcc${{ env.GCC_VERSION }}-${{ env.LOGICAL_RUN_ID }}-chunk-${{ env.CHUNK }}-
+            ccache-${{ env.CACHE_EPOCH }}-${{ env.QT_VERSION }}-gcc${{ env.GCC_VERSION }}-${{ env.LOGICAL_RUN_ID }}-chunk-
+
+      # ---------- 配置 ----------
       - name: Configure Qt (skip WebEngine, MinGW constraint)
         shell: cmd
+        timeout-minutes: 30
         run: |
-          if not exist "build\CMakeCache.txt" (
-            mkdir build
-            cd build
-            call "%QT_SRC_DIR%\configure.bat" ^
-              -release ^
-              -opensource ^
-              -confirm-license ^
-              -platform win32-g++ ^
-              -prefix "%GITHUB_WORKSPACE%\qt-install" ^
-              -nomake examples ^
-              -nomake tests ^
-              -no-warnings-are-errors ^
-              -skip qtwebengine
+          if not exist "build" mkdir build
+          cd build
+          call "%QT_SRC_DIR%\configure.bat" ^
+            -release ^
+            -opensource ^
+            -confirm-license ^
+            -platform win32-g++ ^
+            -prefix "%GITHUB_WORKSPACE%\qt-install" ^
+            -nomake examples ^
+            -nomake tests ^
+            -no-warnings-are-errors ^
+            -skip qtwebengine
+          if errorlevel 1 (
+            cd ..
+            if exist "build" rmdir /s /q build
+            echo Configure failed
+            exit /b 1
           )
+          cd ..
 
-      # ---------- 增量构建 ----------
-      - name: Build Qt (incremental)
+          :: 不依赖 configure 的 -D 透传，直接落到 CMakeCache 里，确保编译走 ccache
+          cmake -S "%QT_SRC_DIR%" -B build ^
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          if errorlevel 1 exit /b 1
+
+      - name: Verify ccache is wired in
+        shell: pwsh
+        run: |
+          $cache = Get-Content "build\CMakeCache.txt" -Raw
+          foreach ($v in @("CMAKE_C_COMPILER_LAUNCHER", "CMAKE_CXX_COMPILER_LAUNCHER")) {
+            if ($cache -notmatch "(?m)^$v:[A-Z_]+=.*ccache") {
+              throw "$v is not set to ccache - the build would not be cached"
+            }
+          }
+          ccache --version | Select-Object -First 1
+          ccache --zero-stats
+
+      # ---------- 构建 ----------
+      # 每个 chunk 都从头编译，但绝大部分 TU 命中 ccache，只有上一轮末端
+      # 没编完的部分需要真正编译
+      - name: Build Qt (ccache-accelerated)
         id: build
         shell: cmd
-        timeout-minutes: 330
+        timeout-minutes: 260
         continue-on-error: true
         run: |
           cd build
           cmake --build . --parallel 4
 
-      # ---------- 完成检测 ----------
-      - name: Check build completion
-        id: check
+      - name: ccache stats
+        if: always()
+        shell: pwsh
+        run: ccache --show-stats
+
+      # 超时/失败后 cmake、ninja、cc1plus 可能还在跑：不杀掉会与 install、
+      # 打包、以及缓存归档同时操作同一批文件（文件被占用 → 打包出半截产物）
+      - name: Kill leftover build processes
+        if: always()
         shell: pwsh
         run: |
-          $core = Get-ChildItem -Path "build" -Filter "Qt6Core.dll" `
-            -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($core) {
-            echo "complete=true"  | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          } else {
-            echo "complete=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          }
+          Get-Process -Name cmake,ninja,g++,gcc,cc1,cc1plus,as,ld,ccache `
+            -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
 
-      # ---------- 安装（如果完成）----------
-      - name: Install Qt (if complete)
-        if: steps.check.outputs.complete == 'true'
+      # ---------- 安装（仅在构建成功时）----------
+      - name: Install Qt
+        id: install
+        if: steps.build.outcome == 'success'
         shell: cmd
+        timeout-minutes: 30
+        continue-on-error: true
         run: |
           cd build
           cmake --install .
 
+      # ---------- 完成检测 ----------
+      # 只认 "build 退出码 0 且 install 成功 且 安装前缀里真的有 Qt6Core.dll"。
+      # 在 build 目录里搜 Qt6Core.dll 会在 qtbase 编完时就命中，等于发布半成品
+      - name: Decide completion
+        id: decide
+        if: always()
+        shell: pwsh
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+        run: |
+          $core = Join-Path $env:GITHUB_WORKSPACE "qt-install\bin\Qt6Core.dll"
+          $ok = ($env:BUILD_OUTCOME -eq "success") -and
+                ($env:INSTALL_OUTCOME -eq "success") -and
+                (Test-Path $core)
+          Write-Host "build=$env:BUILD_OUTCOME install=$env:INSTALL_OUTCOME core=$([bool](Test-Path $core))"
+          "complete=$($ok.ToString().ToLower())" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
       # ---------- 打包为 7z（如果完成）----------
-      - name: Package Qt install as 7z (if complete)
-        if: steps.check.outputs.complete == 'true'
+      - name: Package Qt install as 7z
+        if: steps.decide.outputs.complete == 'true'
         shell: pwsh
         run: |
-          # runner 上 7-Zip 的安装路径（64 位为主，兼容 32 位）
-          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
-          if (-not (Test-Path $sevenZip)) {
-            $sevenZip = "C:\Program Files (x86)\7-Zip\7z.exe"
-          }
+          $sevenZip = $env:SEVEN_ZIP
+          if (-not (Test-Path $sevenZip)) { $sevenZip = "C:\Program Files (x86)\7-Zip\7z.exe" }
           if (-not (Test-Path $sevenZip)) { throw "7-Zip not found on runner" }
 
-          $archive = "qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0.7z"
+          $archive = "qt-$env:QT_VERSION-mingw-gcc$env:GCC_VERSION.7z"
 
           # 在工作区根目录执行，确保归档内保留顶层的 qt-install 目录
           Push-Location $env:GITHUB_WORKSPACE
           try {
-            # -t7z: 7z 格式 | -mx=5: 默认压缩级别（速度/体积均衡）
             & $sevenZip a -t7z -mx=5 -y $archive qt-install
-            if ($LASTEXITCODE -ne 0) {
-              throw "7z failed with exit code $LASTEXITCODE"
-            }
+            if ($LASTEXITCODE -ne 0) { throw "7z failed with exit code $LASTEXITCODE" }
           } finally {
             Pop-Location
           }
 
           Get-Item $archive | Select-Object Name, Length
 
-      # ---------- 自动发布 Release（如果完成）----------
+      # ---------- 发布 Release（如果完成）----------
       - name: Create GitHub Release and upload asset
-        if: steps.check.outputs.complete == 'true'
-        uses: softprops/action-gh-release@v3
+        id: release
+        if: steps.decide.outputs.complete == 'true'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Qt ${{ env.QT_VERSION }} (MinGW GCC 16.2.0)
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Qt ${{ env.QT_VERSION }} (MinGW GCC ${{ env.GCC_VERSION }})
           draft: false
           prerelease: false
           generate_release_notes: true
-          files: qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0.7z
+          fail_on_unmatched_files: true
+          files: qt-${{ env.QT_VERSION }}-mingw-gcc${{ env.GCC_VERSION }}.7z
 
-      # ---------- 自动接力（如果未完成）----------
-      - name: Auto-trigger next chunk (if not complete)
-        if: steps.check.outputs.complete == 'false'
-        shell: pwsh
+      # Release 失败（权限/网络/asset 超限）时至少把产物留在 Artifact 里，不用重跑 5 小时
+      - name: Preserve package when release failed
+        if: failure() && steps.decide.outputs.complete == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qt-${{ env.QT_VERSION }}-mingw-gcc${{ env.GCC_VERSION }}
+          path: qt-*.7z
+          retention-days: 7
+
+      # ---------- 保存编译缓存（总是执行）----------
+      # 显式 save + always()：默认的 cache 后置保存只在 job 成功时才写
+      - name: Save ccache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ env.CACHE_EPOCH }}-${{ env.QT_VERSION }}-gcc${{ env.GCC_VERSION }}-${{ env.LOGICAL_RUN_ID }}-chunk-${{ env.CHUNK }}-a${{ github.run_attempt }}
+
+  # ---------- 自动接力 ----------
+  # 独立 job + needs：必须等 build-qt 的缓存保存跑完再派发下一轮，
+  # 否则下一轮会在缓存还在写的时候去 restore，拿到的是更旧的快照
+  relay:
+    needs: build-qt
+    if: ${{ !cancelled() && needs.build-qt.outputs.complete != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch next chunk
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          gh workflow run "Build Qt 6.12.0 (MinGW, Auto-Release)" `
-            --repo "${{ github.repository }}" `
-            --ref "${{ github.ref_name }}" `
-            -f run_id="${{ env.LOGICAL_RUN_ID }}"
+          next=$(( CHUNK + 1 ))
+          if [ "$next" -gt "$MAX_CHUNKS" ]; then
+            echo "::error::Reached MAX_CHUNKS=$MAX_CHUNKS without a complete build; stopping the chain."
+            exit 1
+          fi
+          # 用工作流文件名而不是 title：gh 按名字找不到就会失败，链路直接断掉
+          gh workflow run build.yml \
+            --repo "$REPO" \
+            --ref "$REF_NAME" \
+            -f run_id="$LOGICAL_RUN_ID" \
+            -f chunk="$next" \
+            -f release_tag="$RELEASE_TAG"
