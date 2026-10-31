@@ -1,4 +1,4 @@
-name: Build Qt 6.12.0 (MinGW, skip WebEngine only)
+name: Build Qt (MinGW GCC, Auto-Chained)
 
 on:
   workflow_dispatch:
@@ -8,44 +8,63 @@ on:
         required: false
         default: ''
   push:
-    branches: [ main ]
+    tags:
+      - 'v*'                    # 仅 v 开头的 tag 触发，例如 v6.12.0
 
 env:
   QT_VERSION: '6.12.0'
-  MINGW_URL: 'https://github.com/niXman/mingw-builds-binaries/releases/download/16.2.0-rt_v14-rev1/x86_64-16.2.0-release-posix-seh-ucrt-rt_v14-rev1.7z'
+  MINGW_URL: >-
+    https://github.com/niXman/mingw-builds-binaries/releases/download/
+    16.2.0-rt_v14-rev1/x86_64-16.2.0-release-posix-seh-ucrt-rt_v14-rev1.7z
+  # 首次 tag 触发用 github.run_id；自动接力时沿用同一个 ID
   LOGICAL_RUN_ID: ${{ github.event.inputs.run_id || github.run_id }}
 
 jobs:
   build-qt:
     runs-on: windows-latest
-    timeout-minutes: 350
+    timeout-minutes: 350          # 留出余量，构建步骤自身还会进一步限制
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python & Perl
+      # ---------- 工具链 ----------
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: shogo82148/actions-setup-perl@v1
+
+      - name: Setup Perl (Strawberry)
+        uses: shogo82148/actions-setup-perl@v1
         with:
           perl-version: '5.38'
           distribution: strawberry
 
-      - name: Install Python html5lib (required by some Qt modules)
+      - name: Install Python html5lib
         shell: pwsh
         run: pip install html5lib
 
-      - name: Setup MinGW GCC 16.2.0
+      - name: Download and extract MinGW GCC 16.2.0
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri $env:MINGW_URL -OutFile mingw.7z
           & "C:\Program Files\7-Zip\7z.exe" x mingw.7z -o"$env:GITHUB_WORKSPACE" -y
-          "$env:GITHUB_WORKSPACE\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "$env:GITHUB_WORKSPACE\mingw64\bin" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Restore source & build cache
+      - name: Verify toolchain
+        shell: cmd
+        run: |
+          where gcc
+          gcc --version
+          cmake --version
+          ninja --version
+
+      # ---------- 源码 + 构建缓存 ----------
+      - name: Restore source and build cache
         uses: actions/cache@v4
         with:
+          # 缓存键绑定逻辑运行 ID，同一次逻辑构建的所有接力共享进度
           key: qt-${{ env.LOGICAL_RUN_ID }}-${{ env.QT_VERSION }}-mingw
           path: |
             qt-everywhere-src-${{ env.QT_VERSION }}
@@ -57,13 +76,17 @@ jobs:
           $src = "qt-everywhere-src-$env:QT_VERSION"
           if (-not (Test-Path $src)) {
             $v = $env:QT_VERSION
-            $url = "https://download.qt.io/official_releases/qt/$($v.Split('.')[0]).$($v.Split('.')[1])/$v/single/qt-everywhere-src-$v.tar.xz"
+            $url = "https://download.qt.io/official_releases/qt/" +
+                   "$($v.Split('.')[0]).$($v.Split('.')[1])/$v/single/" +
+                   "qt-everywhere-src-$v.tar.xz"
             Invoke-WebRequest -Uri $url -OutFile qt-src.tar.xz
             & "C:\Program Files\7-Zip\7z.exe" x qt-src.tar.xz -y
             & "C:\Program Files\7-Zip\7z.exe" x qt-src.tar -y
           }
-          "QT_SRC_DIR=$env:GITHUB_WORKSPACE\$src" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "QT_SRC_DIR=$env:GITHUB_WORKSPACE\$src" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      # ---------- 配置（仅首次）----------
       - name: Configure Qt (skip WebEngine only)
         shell: cmd
         run: |
@@ -82,22 +105,26 @@ jobs:
               -skip qtwebengine
           )
 
-      - name: Build Qt
+      # ---------- 增量构建（可超时，不中断工作流）----------
+      - name: Build Qt (incremental)
         id: build
         shell: cmd
         timeout-minutes: 330
         continue-on-error: true
         run: |
           cd build
+          REM 控制并行度，避免 WebEngine 之外的模块在高并发下 OOM
           cmake --build . --parallel 4
 
+      # ---------- 完成检测 ----------
       - name: Check build completion
         id: check
         shell: pwsh
         run: |
-          $core = Get-ChildItem -Path "build" -Filter "Qt6Core.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $core = Get-ChildItem -Path "build" -Filter "Qt6Core.dll" `
+            -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($core) {
-            echo "complete=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            echo "complete=true"  | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           } else {
             echo "complete=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           }
@@ -113,16 +140,18 @@ jobs:
         if: steps.check.outputs.complete == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: qt-6.12.0-mingw-gcc16.2.0-skip-webengine
+          name: qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0-skip-webengine
           path: ${{ github.workspace }}\qt-install
+          if-no-files-found: error
 
+      # ---------- 自动接力（核心）----------
       - name: Auto-trigger next chunk (if not complete)
         if: steps.check.outputs.complete == 'false'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh workflow run "Build Qt 6.12.0 (MinGW, skip WebEngine only)" `
+          gh workflow run "Build Qt 6.12.0 (MinGW GCC 16.2.0, Auto-Chained)" `
             --repo "${{ github.repository }}" `
             --ref "${{ github.ref_name }}" `
             -f run_id="${{ env.LOGICAL_RUN_ID }}"
