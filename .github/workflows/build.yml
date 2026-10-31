@@ -4,21 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: 'Logical run ID for cache continuity (leave empty on first run)'
+        description: "Logical run ID for cache continuity (leave empty on first run)"
         required: false
-        default: ''
+        default: ""
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 env:
-  QT_VERSION: '6.12.0'
+  QT_VERSION: "6.12.0"
   MINGW_URL: >-
     https://github.com/niXman/mingw-builds-binaries/releases/download/16.2.0-rt_v14-rev1/x86_64-16.2.0-release-posix-seh-ucrt-rt_v14-rev1.7z
   LOGICAL_RUN_ID: ${{ github.event.inputs.run_id || github.run_id }}
 
 permissions:
-  contents: write          # 发布 Release 和上传资产所必需
+  contents: write # 发布 Release 和上传资产所必需
 
 jobs:
   build-qt:
@@ -33,12 +33,12 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Setup Perl (Strawberry)
         uses: shogo82148/actions-setup-perl@v1
         with:
-          perl-version: '5.38'
+          perl-version: "5.38"
           distribution: strawberry
 
       - name: Install Python html5lib
@@ -128,14 +128,33 @@ jobs:
           cd build
           cmake --install .
 
-      # ---------- 打包为 zip（如果完成）----------
-      - name: Package Qt install as zip (if complete)
+      # ---------- 打包为 7z（如果完成）----------
+      - name: Package Qt install as 7z (if complete)
         if: steps.check.outputs.complete == 'true'
         shell: pwsh
         run: |
-          Compress-Archive -Path "$env:GITHUB_WORKSPACE\qt-install\*" `
-            -DestinationPath "qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0.zip" -Force
-          Get-Item "qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0.zip" | Select-Object Name, Length
+          # runner 上 7-Zip 的安装路径（64 位为主，兼容 32 位）
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $sevenZip)) {
+            $sevenZip = "C:\Program Files (x86)\7-Zip\7z.exe"
+          }
+          if (-not (Test-Path $sevenZip)) { throw "7-Zip not found on runner" }
+
+          $archive = "qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0.7z"
+
+          # 在工作区根目录执行，确保归档内保留顶层的 qt-install 目录
+          Push-Location $env:GITHUB_WORKSPACE
+          try {
+            # -t7z: 7z 格式 | -mx=5: 默认压缩级别（速度/体积均衡）
+            & $sevenZip a -t7z -mx=5 -y $archive qt-install
+            if ($LASTEXITCODE -ne 0) {
+              throw "7z failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            Pop-Location
+          }
+
+          Get-Item $archive | Select-Object Name, Length
 
       # ---------- 自动发布 Release（如果完成）----------
       - name: Create GitHub Release and upload asset
@@ -146,8 +165,8 @@ jobs:
           name: Qt ${{ env.QT_VERSION }} (MinGW GCC 16.2.0)
           draft: false
           prerelease: false
-          generate_release_notes: true       # 自动生成 release notes
-          files: qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0.zip
+          generate_release_notes: true
+          files: qt-${{ env.QT_VERSION }}-mingw-gcc16.2.0.7z
 
       # ---------- 自动接力（如果未完成）----------
       - name: Auto-trigger next chunk (if not complete)
