@@ -1,0 +1,128 @@
+name: Build Qt 6.12.0 (MinGW, skip WebEngine only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Logical run ID for cache continuity (leave empty on first run)'
+        required: false
+        default: ''
+  push:
+    branches: [ main ]
+
+env:
+  QT_VERSION: '6.12.0'
+  MINGW_URL: 'https://github.com/niXman/mingw-builds-binaries/releases/download/16.2.0-rt_v14-rev1/x86_64-16.2.0-release-posix-seh-ucrt-rt_v14-rev1.7z'
+  LOGICAL_RUN_ID: ${{ github.event.inputs.run_id || github.run_id }}
+
+jobs:
+  build-qt:
+    runs-on: windows-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python & Perl
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.38'
+          distribution: strawberry
+
+      - name: Install Python html5lib (required by some Qt modules)
+        shell: pwsh
+        run: pip install html5lib
+
+      - name: Setup MinGW GCC 16.2.0
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:MINGW_URL -OutFile mingw.7z
+          & "C:\Program Files\7-Zip\7z.exe" x mingw.7z -o"$env:GITHUB_WORKSPACE" -y
+          "$env:GITHUB_WORKSPACE\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Restore source & build cache
+        uses: actions/cache@v4
+        with:
+          key: qt-${{ env.LOGICAL_RUN_ID }}-${{ env.QT_VERSION }}-mingw
+          path: |
+            qt-everywhere-src-${{ env.QT_VERSION }}
+            build
+
+      - name: Download Qt source (if not cached)
+        shell: pwsh
+        run: |
+          $src = "qt-everywhere-src-$env:QT_VERSION"
+          if (-not (Test-Path $src)) {
+            $v = $env:QT_VERSION
+            $url = "https://download.qt.io/official_releases/qt/$($v.Split('.')[0]).$($v.Split('.')[1])/$v/single/qt-everywhere-src-$v.tar.xz"
+            Invoke-WebRequest -Uri $url -OutFile qt-src.tar.xz
+            & "C:\Program Files\7-Zip\7z.exe" x qt-src.tar.xz -y
+            & "C:\Program Files\7-Zip\7z.exe" x qt-src.tar -y
+          }
+          "QT_SRC_DIR=$env:GITHUB_WORKSPACE\$src" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure Qt (skip WebEngine only)
+        shell: cmd
+        run: |
+          if not exist "build\CMakeCache.txt" (
+            mkdir build
+            cd build
+            call "%QT_SRC_DIR%\configure.bat" ^
+              -release ^
+              -opensource ^
+              -confirm-license ^
+              -platform win32-g++ ^
+              -prefix "%GITHUB_WORKSPACE%\qt-install" ^
+              -nomake examples ^
+              -nomake tests ^
+              -no-warnings-are-errors ^
+              -skip qtwebengine
+          )
+
+      - name: Build Qt
+        id: build
+        shell: cmd
+        timeout-minutes: 330
+        continue-on-error: true
+        run: |
+          cd build
+          cmake --build . --parallel 4
+
+      - name: Check build completion
+        id: check
+        shell: pwsh
+        run: |
+          $core = Get-ChildItem -Path "build" -Filter "Qt6Core.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($core) {
+            echo "complete=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } else {
+            echo "complete=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+
+      - name: Install Qt (if complete)
+        if: steps.check.outputs.complete == 'true'
+        shell: cmd
+        run: |
+          cd build
+          cmake --install .
+
+      - name: Upload Qt install (if complete)
+        if: steps.check.outputs.complete == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qt-6.12.0-mingw-gcc16.2.0-skip-webengine
+          path: ${{ github.workspace }}\qt-install
+
+      - name: Auto-trigger next chunk (if not complete)
+        if: steps.check.outputs.complete == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "Build Qt 6.12.0 (MinGW, skip WebEngine only)" `
+            --repo "${{ github.repository }}" `
+            --ref "${{ github.ref_name }}" `
+            -f run_id="${{ env.LOGICAL_RUN_ID }}"
