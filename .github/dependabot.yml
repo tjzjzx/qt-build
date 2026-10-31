@@ -9,3 +9,8 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "ci"
+    # 大版本升级（checkout v4 → v7 之类）可能带破坏性变更，
+    # 而这里一次构建要跑好几个小时，不能让 bot 静默改掉引用
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
