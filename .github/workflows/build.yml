@@ -193,6 +193,10 @@ jobs:
             ccache-${{ env.CACHE_EPOCH }}-${{ env.QT_VERSION }}-gcc${{ env.GCC_VERSION }}-${{ env.LOGICAL_RUN_ID }}-chunk-
 
       # ---------- 配置 ----------
+      # 关键：必须 -no-pch。ccache 对"用了预编译头"的编译一律标记不可缓存
+      # （could_not_use_precompiled_header），Qt 默认开 PCH，实测 48%~64% 的
+      # 编译因此进不了缓存，导致每个 chunk 都要重做几千个编译、每轮只能前进 300 来个边。
+      # 关掉 PCH 后单次冷编译略慢，但块与块之间的复用从 ~35% 变成 ~100%。
       - name: Configure Qt (skip WebEngine, MinGW constraint)
         shell: cmd
         timeout-minutes: 30
@@ -208,6 +212,7 @@ jobs:
             -nomake examples ^
             -nomake tests ^
             -no-warnings-are-errors ^
+            -no-pch ^
             -skip qtwebengine ^
             -- ^
             -DFEATURE_sql_psql=OFF ^
@@ -274,7 +279,7 @@ jobs:
       - name: Build Qt (ccache-accelerated)
         id: build
         shell: cmd
-        timeout-minutes: 295   # 留 65 分钟给 install/打包/上传
+        timeout-minutes: 325   # install + artifact 交接移到 package job，这里只留 install/上传的余量
         continue-on-error: true
         run: |
           cd build
@@ -335,9 +340,56 @@ jobs:
           @("complete=$($ok.ToString().ToLower())", "build_minutes=$mins") |
             Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      # ---------- 打包为 7z（如果完成）----------
-      - name: Package Qt install as 7z
+      # ---------- 交接给 package job ----------
+      # 打包/发布搬到独立 job：① build 能多吃 30 分钟；② 不会出现"编译刚跑完、
+      # 7z 还没开始就被 360 分钟上限砍掉"导致整块作废；③ 打包失败可以单独重跑
+      - name: Upload Qt install for packaging
         if: steps.decide.outputs.complete == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qt-install-${{ env.LOGICAL_RUN_ID }}-${{ env.CHUNK }}
+          path: qt-install
+          retention-days: 1
+          if-no-files-found: error
+
+      # ---------- 保存编译缓存（总是执行）----------
+      # 显式 save + always()：默认的 cache 后置保存只在 job 成功时才写
+      - name: Save ccache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ env.CACHE_EPOCH }}-${{ env.QT_VERSION }}-gcc${{ env.GCC_VERSION }}-${{ env.LOGICAL_RUN_ID }}-chunk-${{ env.CHUNK }}-a${{ github.run_attempt }}
+
+  # ---------- 打包 + 发布 ----------
+  # 独立 job：build 只管"编译 + install + 交接"，打包和发布有自己的时间额度，
+  # 失败也能单独重跑，不用把 5 小时的编译再吃一遍
+  package:
+    needs: build-qt
+    if: ${{ !cancelled() && needs.build-qt.outputs.complete == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Download Qt install
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run download ${{ github.run_id }} `
+            -n "qt-install-${{ env.LOGICAL_RUN_ID }}-${{ env.CHUNK }}" `
+            -D "$env:GITHUB_WORKSPACE\_dl"
+          # upload-artifact 对单个目录是"内容铺在根上"还是"保留目录名"随版本变过，两种都认
+          if (Test-Path "_dl\bin\Qt6Core.dll") {
+            Move-Item "_dl" "qt-install"
+          } elseif (Test-Path "_dl\qt-install\bin\Qt6Core.dll") {
+            Move-Item "_dl\qt-install" "."
+          } else {
+            throw "downloaded artifact does not look like a Qt install"
+          }
+          if (-not (Test-Path "qt-install\bin\Qt6Core.dll")) { throw "qt-install\bin\Qt6Core.dll missing" }
+
+      - name: Package Qt install as 7z
         shell: pwsh
         run: |
           $sevenZip = $env:SEVEN_ZIP
@@ -357,10 +409,8 @@ jobs:
 
           Get-Item $archive | Select-Object Name, Length
 
-      # ---------- 发布 Release（如果完成）----------
       - name: Create GitHub Release and upload asset
         id: release
-        if: steps.decide.outputs.complete == 'true'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -373,22 +423,12 @@ jobs:
 
       # Release 失败（权限/网络/asset 超限）时至少把产物留在 Artifact 里，不用重跑 5 小时
       - name: Preserve package when release failed
-        if: failure() && steps.decide.outputs.complete == 'true'
+        if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: qt-${{ env.QT_VERSION }}-mingw-gcc${{ env.GCC_VERSION }}
           path: qt-*.7z
           retention-days: 7
-
-      # ---------- 保存编译缓存（总是执行）----------
-      # 显式 save + always()：默认的 cache 后置保存只在 job 成功时才写
-      - name: Save ccache
-        if: always()
-        continue-on-error: true
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ env.CACHE_EPOCH }}-${{ env.QT_VERSION }}-gcc${{ env.GCC_VERSION }}-${{ env.LOGICAL_RUN_ID }}-chunk-${{ env.CHUNK }}-a${{ github.run_attempt }}
 
   # ---------- 自动接力 ----------
   # 独立 job + needs：必须等 build-qt 的缓存保存跑完再派发下一轮，
