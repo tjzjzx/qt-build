@@ -59,7 +59,7 @@ env:
 jobs:
   build-qt:
     runs-on: windows-latest
-    timeout-minutes: 350
+    timeout-minutes: 360   # GitHub 托管 runner 的硬上限是 6 小时
     outputs:
       complete: ${{ steps.decide.outputs.complete }}
       build_started: ${{ steps.build.outcome != 'skipped' }}
@@ -274,7 +274,7 @@ jobs:
       - name: Build Qt (ccache-accelerated)
         id: build
         shell: cmd
-        timeout-minutes: 260
+        timeout-minutes: 295   # 留 65 分钟给 install/打包/上传
         continue-on-error: true
         run: |
           cd build
@@ -283,7 +283,12 @@ jobs:
       - name: ccache stats
         if: always()
         shell: pwsh
-        run: ccache --show-stats
+        run: |
+          ccache --show-stats
+          # --show-stats 只给汇总，"为什么这么多不可缓存"要看 --print-stats 的分项（called_for_link /
+          # output_to_stdout / unsupported_* 等）。只打印非零项，避免刷屏。
+          Write-Host "--- non-zero counters ---"
+          ccache --print-stats | Where-Object { ($_ -split "`t")[1] -ne "0" }
 
       # 超时/失败后 cmake、ninja、cc1plus 可能还在跑：不杀掉会与 install、
       # 打包、以及缓存归档同时操作同一批文件（文件被占用 → 打包出半截产物）
