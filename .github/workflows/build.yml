@@ -376,7 +376,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # package job 没有 checkout，gh 找不到 git 上下文，必须显式 --repo
           gh run download ${{ github.run_id }} `
+            --repo "${{ github.repository }}" `
             -n "qt-install-${{ env.LOGICAL_RUN_ID }}-${{ env.CHUNK }}" `
             -D "$env:GITHUB_WORKSPACE\_dl"
           # upload-artifact 对单个目录是"内容铺在根上"还是"保留目录名"随版本变过，两种都认
