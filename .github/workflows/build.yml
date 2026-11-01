@@ -63,6 +63,7 @@ jobs:
     outputs:
       complete: ${{ steps.decide.outputs.complete }}
       build_started: ${{ steps.build.outcome != 'skipped' }}
+      build_minutes: ${{ steps.decide.outputs.build_minutes }}
 
     steps:
       - name: Checkout
@@ -207,7 +208,11 @@ jobs:
             -nomake examples ^
             -nomake tests ^
             -no-warnings-are-errors ^
-            -skip qtwebengine
+            -skip qtwebengine ^
+            -- ^
+            -DFEATURE_sql_psql=OFF ^
+            -DFEATURE_sql_mysql=OFF ^
+            -DFEATURE_sql_odbc=OFF
           if errorlevel 1 (
             cd ..
             if exist "build" rmdir /s /q build
@@ -222,7 +227,7 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           if errorlevel 1 exit /b 1
 
-      - name: Verify ccache is wired in
+      - name: Verify ccache and skipped sql drivers
         shell: pwsh
         run: |
           $cache = Get-Content "build\CMakeCache.txt" -Raw
@@ -237,6 +242,31 @@ jobs:
           }
           ccache --version | Select-Object -First 1
           ccache --zero-stats
+
+          # 硬校验：runner 自带 PostgreSQL 17 且装在 "Program Files" 下，Qt 会自动探测并启用
+          # psql 插件，然后 cc1 报 "Files/PostgreSQL/17/include: No such file or directory"（路径空格被拆断）。
+          # 光看配置不保险，直接查构建图里还有没有这些插件目标。
+          $ninjaFiles = Get-ChildItem "build" -Filter "*.ninja" -Recurse -ErrorAction SilentlyContinue |
+                        Where-Object { $_.FullName -match "sqldrivers" }
+          if (-not $ninjaFiles) {
+            Write-Warning "no sqldrivers *.ninja found - skipping sql plugin graph check"
+          } else {
+            foreach ($drv in @("QPSQLDriverPlugin", "QMYSQLDriverPlugin", "QODBCDriverPlugin")) {
+              $hit = $ninjaFiles | Select-String -Pattern $drv -SimpleMatch -List | Select-Object -First 1
+              if ($hit) {
+                throw "$drv is still in the build graph ($($hit.Path)) - the -DFEATURE_sql_* flags did not apply"
+              }
+            }
+            Write-Host "sql driver plugins correctly excluded from the build"
+          }
+
+      # 记录编译起点：用来区分"到点超时"（该接力）和"编译报错"（不该接力）
+      - name: Mark build start
+        if: always()
+        shell: pwsh
+        run: |
+          "BUILD_START_EPOCH=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # ---------- 构建 ----------
       # 每个 chunk 都从头编译，但绝大部分 TU 命中 ccache，只有上一轮末端
@@ -292,7 +322,12 @@ jobs:
                 ($env:INSTALL_OUTCOME -eq "success") -and
                 (Test-Path $core)
           Write-Host "build=$env:BUILD_OUTCOME install=$env:INSTALL_OUTCOME core=$([bool](Test-Path $core))"
-          "complete=$($ok.ToString().ToLower())" |
+          $mins = 0
+          if ($env:BUILD_START_EPOCH) {
+            $mins = [int]((([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$env:BUILD_START_EPOCH) / 60))
+          }
+          Write-Host "build_minutes=$mins"
+          @("complete=$($ok.ToString().ToLower())", "build_minutes=$mins") |
             Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       # ---------- 打包为 7z（如果完成）----------
@@ -354,11 +389,12 @@ jobs:
   # 独立 job + needs：必须等 build-qt 的缓存保存跑完再派发下一轮，
   # 否则下一轮会在缓存还在写的时候去 restore，拿到的是更旧的快照
   #
-  # 只有"构建真的跑起来了"才接力：configure / 校验 / 下载这类前置步骤失败是
-  # 确定性错误，重试只会原样再失败一遍，白白每轮烧掉十几分钟额度
+  # 只有"构建真的跑起来了、而且是跑到时间上限才停"的情况才接力：
+  # 编译报错（比如某模块在这个 GCC 上编不过）重试多少次都是一样的结果，
+  # 每轮白烧 20~30 分钟额度。
   relay:
     needs: build-qt
-    if: ${{ !cancelled() && needs.build-qt.outputs.build_started == 'true' && needs.build-qt.outputs.complete != 'true' }}
+    if: ${{ !cancelled() && needs.build-qt.outputs.build_started == 'true' && needs.build-qt.outputs.complete != 'true' && fromJSON(needs.build-qt.outputs.build_minutes || '0') >= 200 }}
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch next chunk
