@@ -11,6 +11,3 @@
 | `GCC_VERSION` / `MINGW_URL` | 版本号和下载地址 |
 | `CCACHE_VERSION` / `CCACHE_URL` | 同上 |
 | `CACHE_EPOCH` | 改一下可以整体作废旧缓存（源码 + ccache） |
-
-- 下载损坏/被截断会在 `Qt source checksum mismatch` 处立刻失败，不用等解压。
-- Release 创建失败时，7z 会作为 Actions Artifact 保留 7 天，不用重跑。
